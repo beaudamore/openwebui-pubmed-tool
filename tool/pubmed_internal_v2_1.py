@@ -23,6 +23,7 @@ from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from pydantic import BaseModel, Field
 
+from open_webui.internal.db import SessionLocal
 from open_webui.models.knowledge import Knowledges, KnowledgeUserModel
 from open_webui.models.users import Users
 from open_webui.routers.files import upload_file_handler
@@ -1315,9 +1316,14 @@ class KnowledgeRepository:
                 raise ValueError("Failed to update knowledge metadata with new file")
 
         # 2. Process file for this knowledge base
-        await run_in_threadpool(
-            process_file,
-            request,
-            ProcessFileForm(file_id=file_id, collection_name=kb_id, content=content),
-            user,
-        )
+        db = SessionLocal()
+        try:
+            await run_in_threadpool(
+                process_file,
+                request,
+                ProcessFileForm(file_id=file_id, collection_name=kb_id, content=content),
+                user,
+                db,
+            )
+        finally:
+            db.close()
