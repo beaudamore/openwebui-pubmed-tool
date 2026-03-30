@@ -129,6 +129,14 @@ class Tools:
             default=0.0,
             description="Minimum relevance score threshold for results (0.0-1.0)",
         )
+        enable_figure_download: bool = Field(
+            default=False,
+            description="Download PMC figure images and store them in OpenWebUI's file store. Images are saved with article metadata (PMID, label, caption) for later retrieval and multimodal training.",
+        )
+        max_figures_per_article: int = Field(
+            default=10,
+            description="Maximum number of figures to download per article (0 = unlimited). Only applies when enable_figure_download is True.",
+        )
         enable_debug_output: bool = Field(
             default=True,
             description="Include debug information in responses",
@@ -715,6 +723,52 @@ class Tools:
                             "doi": safe_value(row["doi"]),
                         })
                         
+                        # Download and store figures if enabled
+                        if self.valves.enable_figure_download:
+                            article_figures = row.get("figures", [])
+                            max_figs = self.valves.max_figures_per_article
+                            if max_figs > 0:
+                                article_figures = article_figures[:max_figs]
+                            fig_stored = 0
+                            for fig_idx, fig in enumerate(article_figures, 1):
+                                fig_url = fig.get("url", "")
+                                if not fig_url:
+                                    continue
+                                try:
+                                    downloaded = KnowledgeRepository.download_figure(fig_url)
+                                    if downloaded is None:
+                                        print(f"[PUBMED] Skipped figure {fig_idx} for PMID {pmid} (download failed or not an image)")
+                                        continue
+                                    img_bytes, img_content_type = downloaded
+                                    ext = img_content_type.split("/")[-1].replace("jpeg", "jpg")
+                                    fig_filename = f"PMID_{pmid}_fig{fig_idx}.{ext}"
+                                    fig_metadata = {
+                                        "pmid": pmid,
+                                        "pmcid": safe_value(row.get("pmcid", "")),
+                                        "figure_index": fig_idx,
+                                        "figure_label": safe_value(fig.get("label", "")),
+                                        "figure_caption": safe_value(fig.get("caption", ""))[:500],
+                                        "source_url": fig_url,
+                                        "article_title": safe_value(row["title"])[:300],
+                                        "query": query,
+                                        "type": "pubmed_figure",
+                                        "source": "pubmed",
+                                    }
+                                    await KnowledgeRepository.upload_image_file(
+                                        request=request,
+                                        user=user,
+                                        filename=fig_filename,
+                                        image_data=img_bytes,
+                                        content_type=img_content_type,
+                                        metadata=fig_metadata,
+                                    )
+                                    fig_stored += 1
+                                    print(f"[PUBMED] Stored figure {fig_idx}/{len(article_figures)} for PMID {pmid}")
+                                except Exception as fig_err:
+                                    print(f"[PUBMED] Error storing figure {fig_idx} for PMID {pmid}: {fig_err}")
+                            if fig_stored > 0:
+                                stored_articles[-1]["figures_stored"] = fig_stored
+
                         if idx % 5 == 0 or idx == len(new_pmids):
                             await emitter.progress_update(f"📥 Archived {idx}/{len(new_pmids)} articles...")
                     
@@ -727,14 +781,19 @@ class Tools:
                 new_summaries = []
                 for i, article in enumerate(stored_articles):
                     if i < output_limit:
+                        fig_note = ""
+                        if article.get("figures_stored"):
+                            fig_note = f" ({article['figures_stored']} figures)"
                         new_summaries.append(
-                            f"- PMID {article['pmid']}: {article['title'][:100]}"
+                            f"- PMID {article['pmid']}: {article['title'][:100]}{fig_note}"
                         )
                 
                 extra_count = len(stored_articles) - output_limit
                 if stored_articles:
+                    total_figs = sum(a.get("figures_stored", 0) for a in stored_articles)
+                    fig_summary = f", {total_figs} figure(s) stored" if total_figs else ""
                     summary_text = (
-                        f"**Archived {len(stored_articles)} article(s) to KB**:\n"
+                        f"**Archived {len(stored_articles)} article(s) to KB{fig_summary}**:\n"
                         + "\n".join(new_summaries)
                     )
                     if extra_count > 0:
@@ -1058,6 +1117,83 @@ class KnowledgeRepository:
                 "url": figure_url,
             })
         return [fig for fig in figures if fig.get("url")]
+
+    @staticmethod
+    def download_figure(url: str, timeout: int = 15) -> Optional[Tuple[bytes, str]]:
+        """Download a figure image from a URL. Returns (bytes, content_type) or None."""
+        try:
+            resp = requests.get(url, timeout=timeout, stream=True, headers={
+                "User-Agent": "OpenWebUI-PubMed-Tool/2.2 (research; image-download)",
+            })
+            if resp.status_code != 200:
+                return None
+            content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if not content_type.startswith("image/"):
+                # PMC sometimes serves HTML error pages — skip
+                return None
+            data = resp.content
+            if len(data) < 100:
+                # Likely a placeholder or error
+                return None
+            return (data, content_type)
+        except Exception:
+            return None
+
+    @staticmethod
+    async def upload_image_file(
+        request: Any,
+        user: Any,
+        filename: str,
+        image_data: bytes,
+        content_type: str,
+        metadata: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        """Upload a binary image to OpenWebUI's file store (not knowledge base)."""
+        safe_metadata = metadata.copy() if metadata else {}
+        safe_metadata.setdefault("source", "pubmed_tool")
+        safe_metadata.setdefault("type", "figure")
+
+        final_metadata = {}
+        for k, v in safe_metadata.items():
+            if v is None:
+                continue
+            if isinstance(v, (str, int, float, bool)):
+                final_metadata[k] = v
+            else:
+                final_metadata[k] = str(v)
+
+        upload = UploadFile(
+            filename=filename,
+            file=SpooledTemporaryFile(max_size=10 * 1024 * 1024),
+            headers={"content-type": content_type},
+        )
+        upload.file.write(image_data)
+        upload.file.seek(0)
+        try:
+            result = await run_in_threadpool(
+                upload_file_handler,
+                request,
+                upload,
+                final_metadata,
+                False,  # process
+                False,  # process_in_background
+                user,
+                None,
+            )
+        finally:
+            await upload.close()
+
+        file_id = getattr(result, "id", None)
+        if file_id is None and isinstance(result, dict):
+            file_id = result.get("id")
+        if not file_id:
+            raise ValueError("Failed to upload image into OpenWebUI files")
+
+        if hasattr(result, "model_dump"):
+            return result.model_dump()
+        if hasattr(result, "dict"):
+            return result.dict()
+        return result
 
     # -------- Context resolution helpers -------- #
     @staticmethod
