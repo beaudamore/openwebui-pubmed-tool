@@ -1,5 +1,11 @@
 # OpenWebUI PubMed Tool
 
+![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
+![OpenWebUI](https://img.shields.io/badge/Open_WebUI-Tool-green)
+![PubMed](https://img.shields.io/badge/PubMed-35M+_Articles-red)
+![License](https://img.shields.io/badge/License-MIT-yellow)
+![NLP](https://img.shields.io/badge/NLP-Entity_Extraction-orange)
+
 Deep research tool integrating PubMed's medical literature database into OpenWebUI with intelligent knowledge base management, automatic deduplication, and NLP-powered article processing.
 
 **Version:** 2.0.0  
