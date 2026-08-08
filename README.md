@@ -118,6 +118,7 @@ Get higher rate limits (10 requests/second vs 3):
 
 - [Complete User Guide](docs/user-guide.md)
 - [Setup Instructions](docs/setup.md)
+- [Headless scheduled triggering](docs/headless-tool-triggering.md)
 - [Physician System Prompt](prompt/pubmed-physician-system-prompt.md)
 
 ## License

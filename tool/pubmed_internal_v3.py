@@ -20,12 +20,12 @@ import nltk
 import pandas as pd
 import spacy
 from fastapi import Request, UploadFile
-from fastapi.concurrency import run_in_threadpool
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 
-from open_webui.internal.db import SessionLocal
+from open_webui.internal.db import get_async_db
 from open_webui.models.knowledge import Knowledges, KnowledgeUserModel
 from open_webui.models.users import Users
 from open_webui.routers.files import upload_file_handler
@@ -46,6 +46,7 @@ try:
     nlp = spacy.load("en_core_web_sm")
 except OSError:
     from spacy.cli import download
+
     download("en_core_web_sm")
     nlp = spacy.load("en_core_web_sm")
 
@@ -82,7 +83,7 @@ class EventEmitter:
 class Tools:
     class Valves(BaseModel):
         model_config = {"arbitrary_types_allowed": True}
-        
+
         pubmed_base_url: str = Field(
             default="https://eutils.ncbi.nlm.nih.gov/entrez/eutils",
             description="PubMed E-utilities base URL",
@@ -94,7 +95,7 @@ class Tools:
         default_knowledge_base: str = Field(
             default="Pubmed Knowledge Base",
             description="Default knowledge base name or ID to search/store data. Will be created automatically if it doesn't exist.",
-        )        
+        )
         enable_query_variation: bool = Field(
             default=True,
             description="Automatically try alternative search queries if no new results are found. Uses PubMed spell check and intelligent query expansion.",
@@ -229,28 +230,21 @@ class Tools:
 """
 
         try:
-            kb = await KnowledgeRepository.find_by_name(
-                user.id,
-                self.valves.default_knowledge_base,
-                permission="write",
+            # Uses an advisory lock internally so concurrent tool calls (e.g. multiple
+            # topics run in parallel) can't race to create duplicate knowledge bases.
+            kb = await KnowledgeRepository.get_or_create_knowledge_base(
+                user_id=user.id,
+                name=self.valves.default_knowledge_base,
+                description="Auto-created by PubMed Deep Research Tool",
             )
-            if not kb:
-                # Create knowledge base if it doesn't exist
-                await emitter.progress_update(
-                    f"📦 Creating new knowledge base: {self.valves.default_knowledge_base}"
-                )
-                kb = await KnowledgeRepository.create_knowledge_base(
-                    user_id=user.id,
-                    name=self.valves.default_knowledge_base,
-                    description="Auto-created by PubMed Deep Research Tool",
-                )
-                await emitter.progress_update(f"✅ Knowledge base created: {kb.name or kb.id}")
 
-            await emitter.progress_update(f"🔍 Querying knowledge container: {kb.name or kb.id}")
+            await emitter.progress_update(
+                f"🔍 Querying knowledge container: {kb.name or kb.id}"
+            )
 
             # Get existing PMIDs from file metadata (more reliable than text search)
             existing_pmids = await KnowledgeRepository.get_existing_pmids_from_kb(kb.id)
-            
+
             # Also query for RAG context to find existing PMIDs
             rag_result = await KnowledgeRepository.query_knowledge_base(
                 request=request,
@@ -268,12 +262,16 @@ class Tools:
                 for doc_text in doc_list:
                     text_pmids.update(re.findall(r"PMID:\s*(\d+)", doc_text))
                 existing_pmids.update(text_pmids)
-                await emitter.progress_update(f"📚 Found {len(existing_pmids)} existing articles")
+                await emitter.progress_update(
+                    f"📚 Found {len(existing_pmids)} existing articles"
+                )
             else:
-                await emitter.progress_update("ℹ️ No existing knowledge found, will create new entries")
+                await emitter.progress_update(
+                    "ℹ️ No existing knowledge found, will create new entries"
+                )
 
             await emitter.progress_update("🔍 Checking PubMed for new articles...")
-            
+
             # Calculate fetch limit to account for duplicates
             fetch_limit = effective_max_results
             if existing_pmids and self.valves.fetch_multiplier > 1.0:
@@ -281,13 +279,15 @@ class Tools:
                 await emitter.progress_update(
                     f"📥 Fetching up to {fetch_limit} articles to find {effective_max_results} new ones..."
                 )
-            
+
             # Track queries tried (for variation logic)
             queries_tried = [query]
             current_query = query
             query_attempt = 1
 
-            def pubmed_search(search_query: str, limit: int = 10) -> List[Dict[str, Any]]:
+            def pubmed_search(
+                search_query: str, limit: int = 10
+            ) -> List[Dict[str, Any]]:
                 esearch_params = {
                     "db": "pubmed",
                     "term": search_query,
@@ -316,7 +316,9 @@ class Tools:
                     "api_key": self.valves.pubmed_api_key or None,
                 }
                 esummary_url = f"{self.valves.pubmed_base_url}/esummary.fcgi"
-                response = requests.get(esummary_url, params=esummary_params, timeout=10)
+                response = requests.get(
+                    esummary_url, params=esummary_params, timeout=10
+                )
                 root = ET.fromstring(response.content)
 
                 results: List[Dict[str, Any]] = []
@@ -387,15 +389,23 @@ class Tools:
 
             # Retry loop with query variations
             articles = []
-            max_attempts = min(max(1, self.valves.max_query_attempts), 5) if self.valves.enable_query_variation else 1
-            
+            max_attempts = (
+                min(max(1, self.valves.max_query_attempts), 5)
+                if self.valves.enable_query_variation
+                else 1
+            )
+
             while query_attempt <= max_attempts:
                 articles = pubmed_search(current_query, fetch_limit)
-                
+
                 # Filter out existing PMIDs and limit to max_results
                 if existing_pmids:
                     articles_before_filter = len(articles)
-                    articles = [art for art in articles if str(art.get("pmid", "")).strip() not in existing_pmids]
+                    articles = [
+                        art
+                        for art in articles
+                        if str(art.get("pmid", "")).strip() not in existing_pmids
+                    ]
                     filtered_count = articles_before_filter - len(articles)
                     if filtered_count > 0:
                         await emitter.progress_update(
@@ -404,40 +414,53 @@ class Tools:
                     # Limit to max_results new articles
                     if len(articles) > effective_max_results:
                         articles = articles[:effective_max_results]
-                        await emitter.progress_update(f"✂️ Limited to {effective_max_results} new articles")
-                
+                        await emitter.progress_update(
+                            f"✂️ Limited to {effective_max_results} new articles"
+                        )
+
                 # If we found new articles, break out of retry loop
                 if articles:
                     break
-                
+
                 # If no articles and we can try variations
                 if query_attempt < max_attempts and self.valves.enable_query_variation:
                     await emitter.progress_update(
                         f"💭 No new results with query '{current_query}', trying variation {query_attempt + 1}..."
                     )
-                    
+
                     # Try PubMed spell check first
                     if query_attempt == 1:
-                        spell_suggestion = KnowledgeRepository.get_pubmed_spell_suggestion(current_query, self.valves)
-                        if spell_suggestion and spell_suggestion.lower() not in [q.lower() for q in queries_tried]:
+                        spell_suggestion = (
+                            KnowledgeRepository.get_pubmed_spell_suggestion(
+                                current_query, self.valves
+                            )
+                        )
+                        if spell_suggestion and spell_suggestion.lower() not in [
+                            q.lower() for q in queries_tried
+                        ]:
                             current_query = spell_suggestion
                             queries_tried.append(current_query)
-                            await emitter.progress_update(f"📝 Trying spell-corrected query: '{current_query}'")
+                            await emitter.progress_update(
+                                f"📝 Trying spell-corrected query: '{current_query}'"
+                            )
                             query_attempt += 1
                             continue
-                    
+
                     # Generate and try variations
                     variations = KnowledgeRepository.generate_query_variations(query)
                     # Filter out already tried queries
                     untried_variations = [
-                        v for v in variations 
+                        v
+                        for v in variations
                         if v.lower() not in [q.lower() for q in queries_tried]
                     ]
-                    
+
                     if untried_variations:
                         current_query = untried_variations[0]
                         queries_tried.append(current_query)
-                        await emitter.progress_update(f"🔀 Trying broadened query: '{current_query}'")
+                        await emitter.progress_update(
+                            f"🔀 Trying broadened query: '{current_query}'"
+                        )
                         query_attempt += 1
                     else:
                         # No more variations to try
@@ -445,13 +468,19 @@ class Tools:
                 else:
                     # No variations enabled or max attempts reached
                     break
-            
+
             if not articles:
                 await emitter.error_update("❌ No NEW articles found in PubMed")
-                no_results_msg = "No NEW articles found" if existing_pmids else "No articles found"
+                no_results_msg = (
+                    "No NEW articles found" if existing_pmids else "No articles found"
+                )
                 no_results = (
                     f"❌ **PubMed Research**: {no_results_msg} for query '{query}'. "
-                    + ("All fetched articles are already in the knowledge base." if existing_pmids else "")
+                    + (
+                        "All fetched articles are already in the knowledge base."
+                        if existing_pmids
+                        else ""
+                    )
                 )
                 await eventer(
                     {
@@ -465,7 +494,9 @@ class Tools:
                 )
                 return pubmed_debug + no_results
 
-            await emitter.progress_update(f"📊 Processing {len(articles)} articles with NLP...")
+            await emitter.progress_update(
+                f"📊 Processing {len(articles)} articles with NLP..."
+            )
 
             def process_data(articles_input: List[Dict[str, str]]) -> pd.DataFrame:
                 df = pd.DataFrame(articles_input)
@@ -521,11 +552,17 @@ class Tools:
                 for _, row in df.iterrows()
                 if str(row["pmid"]).strip()
             }
-            new_pmids = [pmid for pmid in articles_by_pmid if pmid not in existing_pmids]
+            new_pmids = [
+                pmid for pmid in articles_by_pmid if pmid not in existing_pmids
+            ]
 
             # Determine how many articles to include in the LLM-facing output
             # reranker_results caps output; all articles still get archived to KB
-            output_limit = self.valves.reranker_results if self.valves.reranker_results > 0 else effective_max_results
+            output_limit = (
+                self.valves.reranker_results
+                if self.valves.reranker_results > 0
+                else effective_max_results
+            )
 
             # Generate report content (limited to output_limit articles for LLM context)
             timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -561,9 +598,13 @@ class Tools:
 
                 # Truncate abstract for LLM output (full version is stored in KB)
                 abstract_text = safe_value(row["abstract"])
-                abstract_text = KnowledgeRepository.strip_leading_label(abstract_text, "Abstract")
+                abstract_text = KnowledgeRepository.strip_leading_label(
+                    abstract_text, "Abstract"
+                )
                 if len(abstract_text) > 1500:
-                    abstract_text = abstract_text[:1500] + "... [truncated, full text in KB]"
+                    abstract_text = (
+                        abstract_text[:1500] + "... [truncated, full text in KB]"
+                    )
 
                 article_lines.extend(
                     [
@@ -583,7 +624,9 @@ class Tools:
                         for kw in keywords
                         if isinstance(kw, str) and kw.strip()
                     ]
-                    keyword_list = KnowledgeRepository.dedupe_preserve_order(keyword_list)
+                    keyword_list = KnowledgeRepository.dedupe_preserve_order(
+                        keyword_list
+                    )
                     if keyword_list:
                         article_lines.append(f"Keywords: {', '.join(keyword_list)}")
 
@@ -593,18 +636,20 @@ class Tools:
             report_content = "\n".join(report_lines)
 
             response_sections: List[str] = []
-            
+
             # Note: Existing KB records are NOT included in tool output to save tokens.
             # OpenWebUI injects RAG context into the chat automatically.
 
             # 2. Archive New Articles (one file per PMID)
             if new_pmids:
-                await emitter.progress_update(f"🆕 Archiving {len(new_pmids)} new article(s)...")
-                
+                await emitter.progress_update(
+                    f"🆕 Archiving {len(new_pmids)} new article(s)..."
+                )
+
                 stored_articles = []
                 for idx, pmid in enumerate(new_pmids, 1):
                     row = articles_by_pmid[pmid]
-                    
+
                     # Generate individual article content
                     article_content_parts = [
                         f"PMID: {pmid}",
@@ -616,14 +661,16 @@ class Tools:
                         f"Retrieved: {timestamp}",
                         "",
                     ]
-                    
+
                     # Add abstract - prefer structured sections for readability, fall back to combined
                     abstract_sections = row.get("abstract_sections", [])
                     sections_for_article = []
                     if isinstance(abstract_sections, list):
                         seen_sections = set()
                         for section in abstract_sections:
-                            label = (section.get("label") or "Abstract").strip() or "Abstract"
+                            label = (
+                                section.get("label") or "Abstract"
+                            ).strip() or "Abstract"
                             raw_text = (section.get("text") or "").strip()
                             if not raw_text:
                                 continue
@@ -631,11 +678,16 @@ class Tools:
                             if marker in seen_sections:
                                 continue
                             seen_sections.add(marker)
-                            sections_for_article.append({"label": label, "text": raw_text})
+                            sections_for_article.append(
+                                {"label": label, "text": raw_text}
+                            )
                         # Only skip sections if it's a single unlabeled "Abstract"
-                        if len(sections_for_article) == 1 and sections_for_article[0]["label"].lower() == "abstract":
+                        if (
+                            len(sections_for_article) == 1
+                            and sections_for_article[0]["label"].lower() == "abstract"
+                        ):
                             sections_for_article = []
-                    
+
                     # Show structured sections if available (more readable), otherwise combined abstract
                     if sections_for_article:
                         article_content_parts.append("Abstract Sections:")
@@ -648,31 +700,50 @@ class Tools:
                         # No structured sections, fall back to combined abstract
                         abstract_text = safe_value(row["abstract"])
                         if abstract_text and abstract_text != "N/A":
-                            article_content_parts.append("Abstract: " + KnowledgeRepository.strip_leading_label(abstract_text, "Abstract"))
+                            article_content_parts.append(
+                                "Abstract: "
+                                + KnowledgeRepository.strip_leading_label(
+                                    abstract_text, "Abstract"
+                                )
+                            )
                             article_content_parts.append("")
                         else:
                             # No abstract available at all
                             article_content_parts.append("Abstract: N/A")
                             article_content_parts.append("")
-                    
+
                     # Add entities
                     entities_source = row.get("entities_abstract", [])
-                    entities = list(entities_source) if isinstance(entities_source, (list, tuple)) else []
+                    entities = (
+                        list(entities_source)
+                        if isinstance(entities_source, (list, tuple))
+                        else []
+                    )
                     if entities:
-                        entities = [e.strip() for e in entities if isinstance(e, str) and e.strip()]
+                        entities = [
+                            e.strip()
+                            for e in entities
+                            if isinstance(e, str) and e.strip()
+                        ]
                         entities = KnowledgeRepository.dedupe_preserve_order(entities)
                         article_content_parts.append(f"Entities: {', '.join(entities)}")
                         article_content_parts.append("")
-                    
+
                     # Add keywords
                     keywords = row.get("keywords", [])
                     if isinstance(keywords, (list, tuple)) and keywords:
-                        kw_list = [kw.strip() for kw in keywords if isinstance(kw, str) and kw.strip()]
+                        kw_list = [
+                            kw.strip()
+                            for kw in keywords
+                            if isinstance(kw, str) and kw.strip()
+                        ]
                         kw_list = KnowledgeRepository.dedupe_preserve_order(kw_list)
                         if kw_list:
-                            article_content_parts.append(f"Keywords: {', '.join(kw_list)}")
+                            article_content_parts.append(
+                                f"Keywords: {', '.join(kw_list)}"
+                            )
                             article_content_parts.append("")
-                    
+
                     # Add references
                     references = row.get("references", [])
                     if isinstance(references, list) and references:
@@ -681,9 +752,9 @@ class Tools:
                             citation = safe_value(ref.get("citation"))
                             article_content_parts.append(f"- {citation}")
                         article_content_parts.append("")
-                    
+
                     article_content = "\n".join(article_content_parts)
-                    
+
                     # Prepare metadata with PMID for deduplication
                     article_metadata = {
                         "pmid": pmid,
@@ -693,12 +764,16 @@ class Tools:
                         "type": "pubmed_article",
                         "source": "pubmed",
                     }
-                    
+
                     # Generate unique filename per PMID
-                    title_slug = re.sub(r"[^A-Za-z0-9]+", "_", safe_value(row["title"]))[:50]
+                    title_slug = re.sub(
+                        r"[^A-Za-z0-9]+", "_", safe_value(row["title"])
+                    )[:50]
                     article_filename = f"PMID_{pmid}_{title_slug}.txt"
-                    
-                    print(f"[PUBMED] Uploading article {idx}/{len(new_pmids)}: PMID {pmid}")
+
+                    print(
+                        f"[PUBMED] Uploading article {idx}/{len(new_pmids)}: PMID {pmid}"
+                    )
                     try:
                         file_record = await KnowledgeRepository.upload_report_file(
                             request=request,
@@ -708,7 +783,7 @@ class Tools:
                             metadata=article_metadata,
                         )
                         print(f"[PUBMED] File uploaded: ID={file_record['id']}")
-                        
+
                         await KnowledgeRepository.attach_file_to_knowledge(
                             request=request,
                             user=user,
@@ -717,14 +792,16 @@ class Tools:
                             content=article_content,
                         )
                         print(f"[PUBMED] Article PMID {pmid} attached and processed")
-                        
-                        stored_articles.append({
-                            "pmid": pmid,
-                            "title": safe_value(row["title"]),
-                            "authors": safe_value(row["authors"]),
-                            "doi": safe_value(row["doi"]),
-                        })
-                        
+
+                        stored_articles.append(
+                            {
+                                "pmid": pmid,
+                                "title": safe_value(row["title"]),
+                                "authors": safe_value(row["authors"]),
+                                "doi": safe_value(row["doi"]),
+                            }
+                        )
+
                         # Download and store figures if enabled
                         if self.valves.enable_figure_download:
                             article_pmcid = row.get("pmcid")
@@ -738,21 +815,31 @@ class Tools:
                                     url = fig.get("url", "")
                                     if url:
                                         # Extract basename from the URL path
-                                        basename = url.rsplit("/", 1)[-1] if "/" in url else url
+                                        basename = (
+                                            url.rsplit("/", 1)[-1]
+                                            if "/" in url
+                                            else url
+                                        )
                                         fig_hrefs.append(basename)
                                         stem = basename.rsplit(".", 1)[0].lower()
                                         fig_meta_by_stem[stem] = fig
 
-                                await emitter.progress_update(f"🖼️ Downloading figures for PMID {pmid}...")
-                                downloaded_images = KnowledgeRepository.download_pmc_figures(
-                                    pmcid=article_pmcid,
-                                    figure_hrefs=fig_hrefs,
-                                    max_figures=max_figs,
+                                await emitter.progress_update(
+                                    f"🖼️ Downloading figures for PMID {pmid}..."
+                                )
+                                downloaded_images = (
+                                    KnowledgeRepository.download_pmc_figures(
+                                        pmcid=article_pmcid,
+                                        figure_hrefs=fig_hrefs,
+                                        max_figures=max_figs,
+                                    )
                                 )
                                 fig_stored = 0
                                 for img in downloaded_images:
                                     try:
-                                        img_stem = img["filename"].rsplit(".", 1)[0].lower()
+                                        img_stem = (
+                                            img["filename"].rsplit(".", 1)[0].lower()
+                                        )
                                         matched_fig = fig_meta_by_stem.get(img_stem, {})
                                         fig_stored += 1
                                         fig_filename = f"PMID_{pmid}_fig{fig_stored}.{img['filename'].rsplit('.', 1)[-1]}"
@@ -760,10 +847,16 @@ class Tools:
                                             "pmid": pmid,
                                             "pmcid": safe_value(article_pmcid),
                                             "figure_index": fig_stored,
-                                            "figure_label": safe_value(matched_fig.get("label", "")),
-                                            "figure_caption": safe_value(matched_fig.get("caption", ""))[:500],
+                                            "figure_label": safe_value(
+                                                matched_fig.get("label", "")
+                                            ),
+                                            "figure_caption": safe_value(
+                                                matched_fig.get("caption", "")
+                                            )[:500],
                                             "original_filename": img["filename"],
-                                            "article_title": safe_value(row["title"])[:300],
+                                            "article_title": safe_value(row["title"])[
+                                                :300
+                                            ],
                                             "query": query,
                                             "type": "pubmed_figure",
                                             "source": "pubmed",
@@ -776,21 +869,31 @@ class Tools:
                                             content_type=img["content_type"],
                                             metadata=fig_metadata,
                                         )
-                                        print(f"[PUBMED] Stored figure {fig_stored} for PMID {pmid}: {img['filename']}")
+                                        print(
+                                            f"[PUBMED] Stored figure {fig_stored} for PMID {pmid}: {img['filename']}"
+                                        )
                                     except Exception as fig_err:
-                                        print(f"[PUBMED] Error storing figure for PMID {pmid}: {fig_err}")
+                                        print(
+                                            f"[PUBMED] Error storing figure for PMID {pmid}: {fig_err}"
+                                        )
                                 if fig_stored > 0:
                                     stored_articles[-1]["figures_stored"] = fig_stored
-                                    print(f"[PUBMED] Stored {fig_stored} figure(s) for PMID {pmid}")
+                                    print(
+                                        f"[PUBMED] Stored {fig_stored} figure(s) for PMID {pmid}"
+                                    )
 
                         if idx % 5 == 0 or idx == len(new_pmids):
-                            await emitter.progress_update(f"📥 Archived {idx}/{len(new_pmids)} articles...")
-                    
+                            await emitter.progress_update(
+                                f"📥 Archived {idx}/{len(new_pmids)} articles..."
+                            )
+
                     except Exception as upload_error:
                         print(f"[PUBMED] Error uploading PMID {pmid}: {upload_error}")
-                        await emitter.progress_update(f"⚠️ Warning: Failed to archive PMID {pmid}")
+                        await emitter.progress_update(
+                            f"⚠️ Warning: Failed to archive PMID {pmid}"
+                        )
                         continue
-                
+
                 # Build compact summary of stored articles (limited to output_limit)
                 new_summaries = []
                 for i, article in enumerate(stored_articles):
@@ -801,23 +904,35 @@ class Tools:
                         new_summaries.append(
                             f"- PMID {article['pmid']}: {article['title'][:100]}{fig_note}"
                         )
-                
+
                 extra_count = len(stored_articles) - output_limit
                 if stored_articles:
-                    total_figs = sum(a.get("figures_stored", 0) for a in stored_articles)
-                    fig_summary = f", {total_figs} figure(s) stored" if total_figs else ""
+                    total_figs = sum(
+                        a.get("figures_stored", 0) for a in stored_articles
+                    )
+                    fig_summary = (
+                        f", {total_figs} figure(s) stored" if total_figs else ""
+                    )
                     summary_text = (
                         f"**Archived {len(stored_articles)} article(s) to KB{fig_summary}**:\n"
                         + "\n".join(new_summaries)
                     )
                     if extra_count > 0:
-                        summary_text += f"\n... and {extra_count} more (in KB for future queries)"
+                        summary_text += (
+                            f"\n... and {extra_count} more (in KB for future queries)"
+                        )
                     response_sections.append(summary_text)
                 else:
-                    response_sections.append("**Archive Error**: Failed to store new articles.")
+                    response_sections.append(
+                        "**Archive Error**: Failed to store new articles."
+                    )
             else:
-                await emitter.progress_update("ℹ️ No new articles compared to stored history")
-                response_sections.append("**Update Notice**: No new PubMed articles were found. Existing snapshot remains current.")
+                await emitter.progress_update(
+                    "ℹ️ No new articles compared to stored history"
+                )
+                response_sections.append(
+                    "**Update Notice**: No new PubMed articles were found. Existing snapshot remains current."
+                )
 
             await emitter.success_update("✅ Research complete!")
 
@@ -834,12 +949,13 @@ class Tools:
 
             result_text = (
                 f"🔬 **PubMed Deep Research Results** — {query}\n\n"
-                + "\n\n".join(response_sections) + "\n\n"
+                + "\n\n".join(response_sections)
+                + "\n\n"
                 + "--- **Article Details** ---\n"
                 + report_content
                 + omitted_note
             )
-            
+
             await eventer(
                 {
                     "type": "result",
@@ -882,9 +998,7 @@ class KnowledgeRepository:
     async def load_by_user(
         user_id: Any, permission: str = "write"
     ) -> List[KnowledgeUserModel]:
-        knowledge = await run_in_threadpool(
-            Knowledges.get_knowledge_bases_by_user_id, user_id, permission
-        )
+        knowledge = await Knowledges.get_knowledge_bases_by_user_id(user_id, permission)
         return knowledge or []
 
     @staticmethod
@@ -911,23 +1025,47 @@ class KnowledgeRepository:
     ) -> KnowledgeUserModel:
         """Create a new knowledge base for the user."""
         from open_webui.models.knowledge import KnowledgeForm
-        
+
         knowledge_form = KnowledgeForm(
             name=name,
             description=description,
             data={},
         )
-        
-        kb = await run_in_threadpool(
-            Knowledges.insert_new_knowledge,
-            user_id,
-            knowledge_form,
-        )
-        
+
+        kb = await Knowledges.insert_new_knowledge(user_id, knowledge_form)
+
         if not kb:
             raise ValueError(f"Failed to create knowledge base '{name}'")
-        
+
         return kb
+
+    @staticmethod
+    async def get_or_create_knowledge_base(
+        user_id: Any, name: str, description: str = ""
+    ) -> KnowledgeUserModel:
+        """Find a knowledge base by name, creating it if it doesn't exist.
+
+        Wrapped in a Postgres advisory lock keyed by (user_id, name) so that
+        concurrent tool invocations (e.g. multiple topics dispatched as parallel
+        tool calls in the same turn) cannot both see "not found" and each create
+        their own duplicate knowledge base with the same name.
+        """
+        async with get_async_db() as lock_db:
+            lock_key = f"pubmed_kb:{user_id}:{name}"
+            await lock_db.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                {"key": lock_key},
+            )
+
+            kb = await KnowledgeRepository.find_by_name(
+                user_id, name, permission="write"
+            )
+            if kb:
+                return kb
+
+            return await KnowledgeRepository.create_knowledge_base(
+                user_id=user_id, name=name, description=description
+            )
 
     # -------- Generic parsing helpers (moved from tool surface) -------- #
     @staticmethod
@@ -964,7 +1102,7 @@ class KnowledgeRepository:
         normalized = value.strip()
         prefix = f"{label.strip()}:"
         if normalized.lower().startswith(prefix.lower()):
-            return normalized[len(prefix):].lstrip()
+            return normalized[len(prefix) :].lstrip()
         return value
 
     # -------- Moved parsing & figure helpers -------- #
@@ -993,18 +1131,26 @@ class KnowledgeRepository:
         abstract_sections: List[Dict[str, str]] = []
         # Handle structured abstracts with separate AbstractText elements
         for abstract_elem in article.findall(".//Abstract/AbstractText"):
-            label = abstract_elem.attrib.get("Label") or abstract_elem.attrib.get("NlmCategory")
+            label = abstract_elem.attrib.get("Label") or abstract_elem.attrib.get(
+                "NlmCategory"
+            )
             section_text = KnowledgeRepository.extract_text(abstract_elem)
-            abstract_sections.append({"label": label or "Abstract", "text": section_text})
-        
+            abstract_sections.append(
+                {"label": label or "Abstract", "text": section_text}
+            )
+
         # If we got sections, build combined abstract
         if abstract_sections:
             combined_sections = []
             for section in abstract_sections:
                 sec_label = section.get("label") or "Abstract"
                 sec_text = section.get("text") or ""
-                combined_sections.append(f"{sec_label}: {sec_text}" if sec_text else sec_label)
-            details["abstract"] = "\n".join([part.strip() for part in combined_sections if part]).strip()
+                combined_sections.append(
+                    f"{sec_label}: {sec_text}" if sec_text else sec_label
+                )
+            details["abstract"] = "\n".join(
+                [part.strip() for part in combined_sections if part]
+            ).strip()
         else:
             # No structured sections - check for single AbstractText
             abstract_elem = article.find(".//AbstractText")
@@ -1012,24 +1158,28 @@ class KnowledgeRepository:
                 # Try to extract inline sections (e.g., <b>Background:</b> text <b>Methods:</b> text)
                 full_text = KnowledgeRepository.extract_text(abstract_elem)
                 details["abstract"] = full_text
-                
+
                 # Parse inline sections if present (common pattern: <b>Label:</b> text)
-                if "<b>" in ET.tostring(abstract_elem, encoding='unicode', method='xml'):
+                if "<b>" in ET.tostring(
+                    abstract_elem, encoding="unicode", method="xml"
+                ):
                     inline_sections = []
                     current_label = None
                     current_text = []
-                    
+
                     for child in abstract_elem:
-                        if child.tag == 'b':
+                        if child.tag == "b":
                             # Save previous section if exists
                             if current_label and current_text:
-                                inline_sections.append({
-                                    "label": current_label.rstrip(':'),
-                                    "text": ' '.join(current_text).strip()
-                                })
+                                inline_sections.append(
+                                    {
+                                        "label": current_label.rstrip(":"),
+                                        "text": " ".join(current_text).strip(),
+                                    }
+                                )
                                 current_text = []
                             # Start new section
-                            current_label = (child.text or '').strip()
+                            current_label = (child.text or "").strip()
                             # Get text after the <b> tag
                             if child.tail:
                                 current_text.append(child.tail.strip())
@@ -1039,21 +1189,25 @@ class KnowledgeRepository:
                                 current_text.append(child.text.strip())
                             if child.tail:
                                 current_text.append(child.tail.strip())
-                    
+
                     # Save last section
                     if current_label and current_text:
-                        inline_sections.append({
-                            "label": current_label.rstrip(':'),
-                            "text": ' '.join(current_text).strip()
-                        })
-                    
+                        inline_sections.append(
+                            {
+                                "label": current_label.rstrip(":"),
+                                "text": " ".join(current_text).strip(),
+                            }
+                        )
+
                     # Use inline sections if we found any
                     if inline_sections:
                         abstract_sections = inline_sections
-        
+
         details["abstract_sections"] = abstract_sections
 
-        keyword_values = [kw.text.strip() for kw in article.findall(".//Keyword") if kw.text]
+        keyword_values = [
+            kw.text.strip() for kw in article.findall(".//Keyword") if kw.text
+        ]
         details["keywords"] = KnowledgeRepository.dedupe_preserve_order(keyword_values)
 
         coi_elem = article.find(".//CoiStatement")
@@ -1062,7 +1216,11 @@ class KnowledgeRepository:
         references: List[Dict[str, Any]] = []
         for ref in article.findall(".//Reference"):
             citation = KnowledgeRepository.extract_text(ref.find("Citation"))
-            ids = [id_elem.text.strip() for id_elem in ref.findall(".//ArticleId") if id_elem.text]
+            ids = [
+                id_elem.text.strip()
+                for id_elem in ref.findall(".//ArticleId")
+                if id_elem.text
+            ]
             references.append({"citation": citation, "ids": ids})
         details["references"] = references
 
@@ -1082,17 +1240,30 @@ class KnowledgeRepository:
         journal = article.find(".//Journal/Title")
         details["journal"] = KnowledgeRepository.extract_text(journal)
 
-        pub_types = [KnowledgeRepository.extract_text(pt) for pt in article.findall(".//PublicationType") if KnowledgeRepository.extract_text(pt)]
-        details["publication_types"] = KnowledgeRepository.dedupe_preserve_order(pub_types)
+        pub_types = [
+            KnowledgeRepository.extract_text(pt)
+            for pt in article.findall(".//PublicationType")
+            if KnowledgeRepository.extract_text(pt)
+        ]
+        details["publication_types"] = KnowledgeRepository.dedupe_preserve_order(
+            pub_types
+        )
         return details
 
     @staticmethod
     def fetch_pmc_figures(pmcid: Optional[str], valves: Any) -> List[Dict[str, str]]:
         if not pmcid:
             return []
-        base_url = getattr(valves, "pubmed_base_url", "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/")
+        base_url = getattr(
+            valves, "pubmed_base_url", "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+        )
         api_key = getattr(valves, "pubmed_api_key", None)
-        params = {"db": "pmc", "id": pmcid, "retmode": "xml", "api_key": api_key or None}
+        params = {
+            "db": "pmc",
+            "id": pmcid,
+            "retmode": "xml",
+            "api_key": api_key or None,
+        }
         response = requests.get(f"{base_url}/efetch.fcgi", params=params, timeout=10)
         if response.status_code != 200:
             return []
@@ -1104,8 +1275,22 @@ class KnowledgeRepository:
         for fig in root.iter():
             if KnowledgeRepository.strip_namespace(fig.tag) != "fig":
                 continue
-            label_elem = next((child for child in fig if KnowledgeRepository.strip_namespace(child.tag) == "label"), None)
-            caption_elem = next((child for child in fig if KnowledgeRepository.strip_namespace(child.tag) == "caption"), None)
+            label_elem = next(
+                (
+                    child
+                    for child in fig
+                    if KnowledgeRepository.strip_namespace(child.tag) == "label"
+                ),
+                None,
+            )
+            caption_elem = next(
+                (
+                    child
+                    for child in fig
+                    if KnowledgeRepository.strip_namespace(child.tag) == "caption"
+                ),
+                None,
+            )
             graphic_elem = None
             for descendant in fig.iter():
                 if KnowledgeRepository.strip_namespace(descendant.tag) == "graphic":
@@ -1125,11 +1310,14 @@ class KnowledgeRepository:
                         figure_url = f"https://www.ncbi.nlm.nih.gov{href_value}"
                     else:
                         figure_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/pdf/{href_value}"
-            figures.append({
-                "label": KnowledgeRepository.extract_text(label_elem) or fig.attrib.get("id", ""),
-                "caption": KnowledgeRepository.extract_text(caption_elem),
-                "url": figure_url,
-            })
+            figures.append(
+                {
+                    "label": KnowledgeRepository.extract_text(label_elem)
+                    or fig.attrib.get("id", ""),
+                    "caption": KnowledgeRepository.extract_text(caption_elem),
+                    "url": figure_url,
+                }
+            )
         return [fig for fig in figures if fig.get("url")]
 
     @staticmethod
@@ -1170,7 +1358,9 @@ class KnowledgeRepository:
         for link in oa_root.iter("link"):
             if link.attrib.get("format") == "tgz":
                 href = link.attrib.get("href", "")
-                tgz_url = href.replace("ftp://ftp.ncbi.nlm.nih.gov", "https://ftp.ncbi.nlm.nih.gov")
+                tgz_url = href.replace(
+                    "ftp://ftp.ncbi.nlm.nih.gov", "https://ftp.ncbi.nlm.nih.gov"
+                )
                 break
         if not tgz_url:
             return []
@@ -1186,9 +1376,12 @@ class KnowledgeRepository:
         # Step 3: Extract image files
         IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".tif", ".tiff")
         CONTENT_TYPE_MAP = {
-            ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-            ".png": "image/png", ".gif": "image/gif",
-            ".tif": "image/tiff", ".tiff": "image/tiff",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".tif": "image/tiff",
+            ".tiff": "image/tiff",
         }
 
         # Build a set of expected basenames from figure hrefs (without extension)
@@ -1205,7 +1398,11 @@ class KnowledgeRepository:
                     if not member.isfile():
                         continue
                     name_lower = member.name.lower()
-                    basename = member.name.rsplit("/", 1)[-1] if "/" in member.name else member.name
+                    basename = (
+                        member.name.rsplit("/", 1)[-1]
+                        if "/" in member.name
+                        else member.name
+                    )
                     if not any(name_lower.endswith(ext) for ext in IMAGE_EXTENSIONS):
                         continue
 
@@ -1222,14 +1419,20 @@ class KnowledgeRepository:
                     if len(data) < 100:
                         continue
 
-                    ext = "." + basename.rsplit(".", 1)[-1].lower() if "." in basename else ".jpg"
+                    ext = (
+                        "." + basename.rsplit(".", 1)[-1].lower()
+                        if "." in basename
+                        else ".jpg"
+                    )
                     content_type = CONTENT_TYPE_MAP.get(ext, "image/jpeg")
 
-                    results.append({
-                        "filename": basename,
-                        "data": data,
-                        "content_type": content_type,
-                    })
+                    results.append(
+                        {
+                            "filename": basename,
+                            "data": data,
+                            "content_type": content_type,
+                        }
+                    )
 
                     if max_figures > 0 and len(results) >= max_figures:
                         break
@@ -1287,8 +1490,7 @@ class KnowledgeRepository:
         upload.file.write(image_data)
         upload.file.seek(0)
         try:
-            result = await run_in_threadpool(
-                upload_file_handler,
+            result = await upload_file_handler(
                 request,
                 upload,
                 final_metadata,
@@ -1317,7 +1519,7 @@ class KnowledgeRepository:
     async def resolve_user(__user__: Optional[dict]) -> Any:
         if not __user__ or not __user__.get("id"):
             raise ValueError("User context with an 'id' is required")
-        user = await run_in_threadpool(Users.get_user_by_id, str(__user__["id"]))
+        user = await Users.get_user_by_id(str(__user__["id"]))
         if not user:
             raise ValueError("Unable to resolve OpenWebUI user")
         return user
@@ -1333,14 +1535,20 @@ class KnowledgeRepository:
     def get_pubmed_spell_suggestion(query: str, valves: Any) -> Optional[str]:
         """Get spelling suggestions from PubMed ESpell."""
         try:
-            base_url = getattr(valves, "pubmed_base_url", "https://eutils.ncbi.nlm.nih.gov/entrez/eutils")
+            base_url = getattr(
+                valves,
+                "pubmed_base_url",
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils",
+            )
             api_key = getattr(valves, "pubmed_api_key", None)
             params = {
                 "db": "pubmed",
                 "term": query,
                 "api_key": api_key or None,
             }
-            response = requests.get(f"{base_url}/espell.fcgi", params=params, timeout=10)
+            response = requests.get(
+                f"{base_url}/espell.fcgi", params=params, timeout=10
+            )
             if response.status_code == 200:
                 root = ET.fromstring(response.content)
                 corrected = root.find("CorrectedQuery")
@@ -1357,56 +1565,60 @@ class KnowledgeRepository:
     def generate_query_variations(query: str) -> List[str]:
         """Generate variations of the search query using spaCy and simple heuristics."""
         variations = []
-        
+
         # Parse with spaCy to extract entities and key terms
         doc = nlp(query.lower())
-        
+
         # Strategy 1: Remove year/date constraints if present
-        date_pattern = r'\b(19|20)\d{2}\b|\b(\d{4}):(\d{4})\b'
+        date_pattern = r"\b(19|20)\d{2}\b|\b(\d{4}):(\d{4})\b"
         if re.search(date_pattern, query):
-            variation = re.sub(date_pattern, '', query).strip()
-            variation = re.sub(r'\s+', ' ', variation)  # Clean extra spaces
+            variation = re.sub(date_pattern, "", query).strip()
+            variation = re.sub(r"\s+", " ", variation)  # Clean extra spaces
             if variation and variation.lower() != query.lower():
                 variations.append(variation)
-        
+
         # Strategy 2: Broaden by removing field tags like [journal], [author], etc.
-        field_pattern = r'\[\w+\]'
+        field_pattern = r"\[\w+\]"
         if re.search(field_pattern, query):
-            variation = re.sub(field_pattern, '', query).strip()
-            variation = re.sub(r'\s+', ' ', variation)
+            variation = re.sub(field_pattern, "", query).strip()
+            variation = re.sub(r"\s+", " ", variation)
             if variation and variation.lower() != query.lower():
                 variations.append(variation)
-        
+
         # Strategy 3: Remove AND/OR Boolean operators to broaden
-        if ' AND ' in query.upper() or ' OR ' in query.upper():
+        if " AND " in query.upper() or " OR " in query.upper():
             # Replace AND with OR to broaden
-            variation = re.sub(r'\s+AND\s+', ' OR ', query, flags=re.IGNORECASE)
+            variation = re.sub(r"\s+AND\s+", " OR ", query, flags=re.IGNORECASE)
             if variation.lower() != query.lower():
                 variations.append(variation)
-            
+
             # Remove AND entirely
-            variation = re.sub(r'\s+AND\s+', ' ', query, flags=re.IGNORECASE)
-            variation = re.sub(r'\s+', ' ', variation).strip()
+            variation = re.sub(r"\s+AND\s+", " ", query, flags=re.IGNORECASE)
+            variation = re.sub(r"\s+", " ", variation).strip()
             if variation and variation.lower() != query.lower():
                 variations.append(variation)
-        
+
         # Strategy 4: Use just the main entities/noun phrases
-        entities = [ent.text for ent in doc.ents if ent.label_ in ['DISEASE', 'CHEMICAL', 'ORG', 'GPE']]
+        entities = [
+            ent.text
+            for ent in doc.ents
+            if ent.label_ in ["DISEASE", "CHEMICAL", "ORG", "GPE"]
+        ]
         noun_chunks = [chunk.text for chunk in doc.noun_chunks]
         key_terms = entities + noun_chunks
-        
+
         if key_terms:
             # Try just the entities
-            variation = ' '.join(entities) if entities else None
+            variation = " ".join(entities) if entities else None
             if variation and variation.lower() != query.lower():
                 variations.append(variation)
-            
+
             # Try noun phrases
             if len(noun_chunks) > 0 and len(noun_chunks) <= 3:
-                variation = ' '.join(noun_chunks)
+                variation = " ".join(noun_chunks)
                 if variation.lower() != query.lower():
                     variations.append(variation)
-        
+
         # Deduplicate and limit
         seen = set([query.lower()])
         unique_variations = []
@@ -1415,29 +1627,43 @@ class KnowledgeRepository:
             if var_lower and var_lower not in seen and len(var_lower) > 3:
                 seen.add(var_lower)
                 unique_variations.append(var)
-        
+
         return unique_variations[:4]  # Limit to 4 variations
 
     # -------- Knowledge base interaction wrappers -------- #
     @staticmethod
     async def get_existing_pmids_from_kb(kb_id: str) -> Set[str]:
-        """Get all PMIDs already stored in the knowledge base by checking file metadata."""
+        """Get all PMIDs already stored in the knowledge base.
+
+        Reads the PMID from the correct nested metadata location
+        (`file.meta["data"]["pmid"]`). `upload_file_handler` in
+        open_webui/routers/files.py nests any custom metadata dict passed to
+        it under `meta["data"]`, never at the top level of `meta` -- this
+        previously read `file_meta.get("pmid")` (top-level), which can never
+        match and was silently dead code, saved only by the filename fallback
+        below. Falls back to parsing the PMID directly out of the filename
+        (format: "PMID_<pmid>_<title_slug>.txt") for resilience against files
+        that predate this fix or came from elsewhere.
+        """
         pmids = set()
         try:
-            knowledge = await run_in_threadpool(Knowledges.get_knowledge_by_id, kb_id)
-            if knowledge:
-                data = getattr(knowledge, "data", None) or {}
-                file_ids = data.get("file_ids", [])
-                
-                if file_ids:
-                    from open_webui.models.files import Files
-                    for file_id in file_ids:
-                        file_record = await run_in_threadpool(Files.get_file_by_id, file_id)
-                        if file_record:
-                            file_meta = getattr(file_record, "meta", None) or {}
-                            pmid = file_meta.get("pmid")
-                            if pmid:
-                                pmids.add(str(pmid))
+            # Query the actual Knowledge<->File association table directly.
+            # (The legacy `knowledge.data.file_ids` list is no longer populated
+            # in this OpenWebUI version, which silently broke deduplication.)
+            files = await Knowledges.get_files_by_id(kb_id)
+            for file_record in files:
+                file_meta = getattr(file_record, "meta", None) or {}
+                custom_data = file_meta.get("data") or {}
+                pmid = custom_data.get("pmid") or file_meta.get("pmid")
+                if pmid:
+                    pmids.add(str(pmid))
+                    continue
+
+                # Fallback: parse the PMID directly out of the filename.
+                filename = getattr(file_record, "filename", "") or ""
+                match = re.match(r"PMID_(\d+)_", filename)
+                if match:
+                    pmids.add(match.group(1))
         except Exception:
             # If we can't get PMIDs from metadata, fall back to text search
             pass
@@ -1458,16 +1684,22 @@ class KnowledgeRepository:
             "collection_names": [kb_id],
             "query": query,
             "k": max(limit, max_results),
-            "hybrid": getattr(valves, "enable_hybrid_search", False) if valves else False,
+            "hybrid": (
+                getattr(valves, "enable_hybrid_search", False) if valves else False
+            ),
         }
         # Add BM25 weight if hybrid search is enabled
         if getattr(valves, "enable_hybrid_search", False) if valves else False:
             bm25_weight = getattr(valves, "hybrid_bm25_weight", 0.5) if valves else 0.5
             form_kwargs["hybrid_bm25_weight"] = bm25_weight
             # Add enriched texts option for hybrid search
-            enriched = getattr(valves, "enable_enriched_hybrid_search", False) if valves else False
+            enriched = (
+                getattr(valves, "enable_enriched_hybrid_search", False)
+                if valves
+                else False
+            )
             form_kwargs["enable_enriched_texts"] = enriched
-        
+
         reranker = getattr(valves, "reranker_results", 0) if valves else 0
         if reranker > 0:
             form_kwargs["k_reranker"] = reranker
@@ -1475,7 +1707,9 @@ class KnowledgeRepository:
         if relevance > 0:
             form_kwargs["r"] = relevance
         form = QueryCollectionsForm(**form_kwargs)
-        return await query_collection_handler(request=request, form_data=form, user=user)
+        return await query_collection_handler(
+            request=request, form_data=form, user=user
+        )
 
     @staticmethod
     async def upload_report_file(
@@ -1489,7 +1723,7 @@ class KnowledgeRepository:
         safe_metadata = metadata.copy() if metadata else {}
         safe_metadata.setdefault("source", "pubmed_tool")
         safe_metadata.setdefault("type", "text")
-        
+
         final_metadata = {}
         for k, v in safe_metadata.items():
             if v is None:
@@ -1507,13 +1741,12 @@ class KnowledgeRepository:
         upload.file.write(content.encode("utf-8"))
         upload.file.seek(0)
         try:
-            result = await run_in_threadpool(
-                upload_file_handler,
+            result = await upload_file_handler(
                 request,
                 upload,
                 final_metadata,
-                False, # process
-                False, # process_in_background
+                False,  # process
+                False,  # process_in_background
                 user,
                 None,
             )
@@ -1544,16 +1777,11 @@ class KnowledgeRepository:
     ) -> None:
         # 1. Associate file with knowledge base
         try:
-            await run_in_threadpool(
-                Knowledges.add_file_to_knowledge_by_id,
-                kb_id,
-                file_id,
-                user.id,
-            )
+            await Knowledges.add_file_to_knowledge_by_id(kb_id, file_id, user.id)
         except AttributeError:
             # Fallback for older versions or if method missing
-            def _update_metadata() -> bool:
-                knowledge = Knowledges.get_knowledge_by_id(id=kb_id)
+            async def _update_metadata() -> bool:
+                knowledge = await Knowledges.get_knowledge_by_id(id=kb_id)
                 if not knowledge:
                     return False
                 data = getattr(knowledge, "data", None) or {}
@@ -1561,22 +1789,21 @@ class KnowledgeRepository:
                 if file_id not in file_ids:
                     file_ids.append(file_id)
                     data["file_ids"] = file_ids
-                    Knowledges.update_knowledge_data_by_id(id=kb_id, data=data)
+                    await Knowledges.update_knowledge_data_by_id(id=kb_id, data=data)
                 return True
 
-            updated = await run_in_threadpool(_update_metadata)
+            updated = await _update_metadata()
             if not updated:
                 raise ValueError("Failed to update knowledge metadata with new file")
 
         # 2. Process file for this knowledge base
-        db = SessionLocal()
-        try:
-            await run_in_threadpool(
-                process_file,
+        async with get_async_db() as db:
+            await process_file(
                 request,
-                ProcessFileForm(file_id=file_id, collection_name=kb_id, content=content),
+                ProcessFileForm(
+                    file_id=file_id, collection_name=kb_id, content=content
+                ),
                 user,
                 db,
             )
-        finally:
-            db.close()
+
