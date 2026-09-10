@@ -2,10 +2,11 @@
 title: PubMed Deep Research Tool v3
 author: Beau D'Amore www.damore.ai
 version: 3.0.0
-description: Deep PubMed research with native OpenWebUI integrations and PMC figure image download/storage.
+description: Deep PubMed research with native OpenWebUI integrations and PMC figure image download/storage. Requires OpenWebUI 0.11 or newer.
 requirements: pandas, spacy, nltk
 """
 
+import asyncio
 import io
 import re
 import requests
@@ -998,7 +999,9 @@ class KnowledgeRepository:
     async def load_by_user(
         user_id: Any, permission: str = "write"
     ) -> List[KnowledgeUserModel]:
-        knowledge = await Knowledges.get_knowledge_bases_by_user_id(user_id, permission)
+        response = await Knowledges.search_knowledge_bases(user_id, {"query": None}, 0, 100)
+        items = getattr(response, "items", None)
+        knowledge = list(items) if items is not None else list(response or [])
         return knowledge or []
 
     @staticmethod
@@ -1039,33 +1042,53 @@ class KnowledgeRepository:
 
         return kb
 
+    # Fallback serialization for backends without Postgres advisory locks
+    # (e.g. the default SQLite database): OpenWebUI serves all requests
+    # from a single process, so an in-process lock is sufficient to prevent
+    # concurrent tool calls from creating duplicate knowledge bases.
+    _kb_create_lock = asyncio.Lock()
+
     @staticmethod
     async def get_or_create_knowledge_base(
         user_id: Any, name: str, description: str = ""
     ) -> KnowledgeUserModel:
         """Find a knowledge base by name, creating it if it doesn't exist.
 
-        Wrapped in a Postgres advisory lock keyed by (user_id, name) so that
-        concurrent tool invocations (e.g. multiple topics dispatched as parallel
-        tool calls in the same turn) cannot both see "not found" and each create
-        their own duplicate knowledge base with the same name.
+        Concurrent tool invocations (e.g. multiple topics dispatched as parallel
+        tool calls in the same turn) are serialized on the (user_id, name) key
+        so they cannot both see "not found" and each create a duplicate:
+        Postgres uses a transaction-scoped advisory lock, while SQLite
+        (OpenWebUI's default backend) uses an in-process asyncio.Lock.
         """
-        async with get_async_db() as lock_db:
-            lock_key = f"pubmed_kb:{user_id}:{name}"
-            await lock_db.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-                {"key": lock_key},
-            )
+        lock_key = f"pubmed_kb:{user_id}:{name}"
 
+        async def _resolve():
             kb = await KnowledgeRepository.find_by_name(
                 user_id, name, permission="write"
             )
             if kb:
                 return kb
-
             return await KnowledgeRepository.create_knowledge_base(
                 user_id=user_id, name=name, description=description
             )
+
+        async with get_async_db() as lock_db:
+            dialect_name = getattr(
+                getattr(getattr(lock_db, "bind", None), "dialect", None),
+                "name",
+                "",
+            )
+            if dialect_name == "postgresql":
+                # Held for the duration of this session (released on close).
+                await lock_db.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                    {"key": lock_key},
+                )
+                return await _resolve()
+
+            # SQLite (or any other backend): no advisory locks available.
+            async with KnowledgeRepository._kb_create_lock:
+                return await _resolve()
 
     # -------- Generic parsing helpers (moved from tool surface) -------- #
     @staticmethod
@@ -1776,25 +1799,7 @@ class KnowledgeRepository:
         content: Optional[str] = None,
     ) -> None:
         # 1. Associate file with knowledge base
-        try:
-            await Knowledges.add_file_to_knowledge_by_id(kb_id, file_id, user.id)
-        except AttributeError:
-            # Fallback for older versions or if method missing
-            async def _update_metadata() -> bool:
-                knowledge = await Knowledges.get_knowledge_by_id(id=kb_id)
-                if not knowledge:
-                    return False
-                data = getattr(knowledge, "data", None) or {}
-                file_ids = data.get("file_ids", [])
-                if file_id not in file_ids:
-                    file_ids.append(file_id)
-                    data["file_ids"] = file_ids
-                    await Knowledges.update_knowledge_data_by_id(id=kb_id, data=data)
-                return True
-
-            updated = await _update_metadata()
-            if not updated:
-                raise ValueError("Failed to update knowledge metadata with new file")
+        await Knowledges.add_file_to_knowledge_by_id(kb_id, file_id, user.id)
 
         # 2. Process file for this knowledge base
         async with get_async_db() as db:
